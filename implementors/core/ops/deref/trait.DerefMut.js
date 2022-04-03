@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["anyhow"] = [{"text":"impl DerefMut for <a class=\"struct\" href=\"anyhow/struct.Error.html\" title=\"struct anyhow::Error\">Error</a>","synthetic":false,"types":["anyhow::Error"]}];
+implementors["esp_idf_hal"] = [{"text":"impl&lt;'a, T&gt; DerefMut for <a class=\"struct\" href=\"esp_idf_hal/mutex/struct.MutexGuard.html\" title=\"struct esp_idf_hal::mutex::MutexGuard\">MutexGuard</a>&lt;'a, T&gt;","synthetic":false,"types":["esp_idf_hal::mutex::MutexGuard"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
