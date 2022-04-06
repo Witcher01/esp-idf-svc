@@ -76,4 +76,7 @@ pub mod timer;
 ))]
 pub mod wifi;
 
+// TODO: cfg
+pub mod ws;
+
 mod private;
