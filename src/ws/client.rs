@@ -1,5 +1,9 @@
 use core::time;
 
+use embedded_svc::{
+    errors::Errors,
+    ws::{FrameType, Sender},
+};
 use esp_idf_hal::delay::TickType;
 use esp_idf_sys::*;
 
@@ -200,6 +204,35 @@ impl EspWebSocketClient {
             timeout: t.0,
         })
     }
+
+    fn check(result: c_types::c_int) -> Result<usize, EspError> {
+        if result < 0 {
+            esp!(result)?;
+        }
+
+        Ok(result as _)
+    }
+
+    fn send_bin(
+        &mut self,
+        frame_data: Option<&[u8]>,
+    ) -> Result<usize, <EspWebSocketClient as Errors>::Error> {
+        let mut content = core::ptr::null();
+        let mut content_length: usize = 0;
+
+        if let Some(data) = frame_data {
+            content = data.as_ref().as_ptr();
+            content_length = data.as_ref().len();
+        }
+
+        Self::check(unsafe {
+            esp_websocket_client_send_bin(
+                self.handle,
+                content as _,
+                content_length as _,
+                self.timeout,
+            )
+        })
     }
 }
 
@@ -208,5 +241,25 @@ impl Drop for EspWebSocketClient {
         // TODO: use esp_websocket_client_close instead
         esp!(unsafe { esp_websocket_client_stop(self.handle) }).unwrap();
         esp!(unsafe { esp_websocket_client_destroy(self.handle) }).unwrap();
+    }
+}
+
+impl Errors for EspWebSocketClient {
+    type Error = EspError;
+}
+
+impl Sender for EspWebSocketClient {
+    fn send(
+        &mut self,
+        frame_type: FrameType,
+        frame_data: Option<&[u8]>,
+    ) -> Result<(), Self::Error> {
+        // TODO: exhaustive
+        match frame_type {
+            FrameType::Binary(_) => self.send_bin(frame_data)?,
+            _ => todo!(),
+        };
+
+        Ok(())
     }
 }
