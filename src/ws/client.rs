@@ -1,5 +1,6 @@
 use core::time;
 
+use esp_idf_hal::delay::TickType;
 use esp_idf_sys::*;
 
 use crate::private::common::Newtype;
@@ -172,10 +173,18 @@ impl<'a> From<EspWebSocketClientConfig<'a>> for (esp_websocket_client_config_t, 
     }
 }
 
-pub struct EspWebSocketClient(esp_websocket_client_handle_t);
+pub struct EspWebSocketClient {
+    handle: esp_websocket_client_handle_t,
+    // used for the timeout in every call to a send method in the c lib as the
+    // `send` method in the `Sender` trait in embedded_svc::ws does not take a timeout itself
+    timeout: TickType_t,
+}
 
 impl EspWebSocketClient {
-    pub fn new(config: EspWebSocketClientConfig) -> Result<Self, EspError> {
+    pub fn new(
+        config: EspWebSocketClientConfig,
+        timeout: time::Duration,
+    ) -> Result<Self, EspError> {
         let (conf, _cstrs): (esp_websocket_client_config_t, RawCstrs) = config.into();
         let handle = unsafe { esp_websocket_client_init(&conf) };
 
@@ -184,14 +193,20 @@ impl EspWebSocketClient {
         }
         esp!(unsafe { esp_websocket_client_start(handle) })?;
 
-        Ok(Self(handle))
+        let t: TickType = timeout.into();
+
+        Ok(Self {
+            handle,
+            timeout: t.0,
+        })
+    }
     }
 }
 
 impl Drop for EspWebSocketClient {
     fn drop(&mut self) {
         // TODO: use esp_websocket_client_close instead
-        esp!(unsafe { esp_websocket_client_stop(self.0) }).unwrap();
-        esp!(unsafe { esp_websocket_client_destroy(self.0) }).unwrap();
+        esp!(unsafe { esp_websocket_client_stop(self.handle) }).unwrap();
+        esp!(unsafe { esp_websocket_client_destroy(self.handle) }).unwrap();
     }
 }
