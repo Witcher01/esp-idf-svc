@@ -238,8 +238,7 @@ impl EspWebSocketClient {
 
 impl Drop for EspWebSocketClient {
     fn drop(&mut self) {
-        // TODO: use esp_websocket_client_close instead
-        esp!(unsafe { esp_websocket_client_stop(self.handle) }).unwrap();
+        esp!(unsafe { esp_websocket_client_close(self.handle, self.timeout) }).unwrap();
         esp!(unsafe { esp_websocket_client_destroy(self.handle) }).unwrap();
     }
 }
