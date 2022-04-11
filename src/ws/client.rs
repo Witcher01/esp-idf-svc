@@ -267,13 +267,16 @@ impl Sender for EspWebSocketClient {
         frame_type: FrameType,
         frame_data: Option<&[u8]>,
     ) -> Result<(), Self::Error> {
-        // TODO: exhaustive
-        // TODO: implement fragmented sending of data
         match frame_type {
             FrameType::Binary(false) | FrameType::Text(false) => {
                 self.send_data(frame_type, frame_data)?
             }
-            _ => todo!(),
+            FrameType::Binary(true) | FrameType::Text(true) => todo!(),
+            FrameType::Ping => todo!(),
+            FrameType::Pong => todo!(),
+            FrameType::Close => todo!(),
+            FrameType::SocketClose => todo!(),
+            FrameType::Continue(_) => todo!(),
         };
 
         Ok(())
