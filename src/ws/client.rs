@@ -38,6 +38,7 @@ impl From<EspWebSocketTransport> for Newtype<esp_websocket_transport_t> {
     }
 }
 
+#[derive(Default)]
 pub struct EspWebSocketClientConfig<'a> {
     pub uri: Option<&'a str>,
     pub host: Option<&'a str>,
@@ -70,40 +71,6 @@ pub struct EspWebSocketClientConfig<'a> {
     // pub cert_pem: Option<&'a str>,
     // pub client_cert: Option<&'a str>,
     // pub client_key: Option<&'a str>,
-}
-
-impl<'a> Default for EspWebSocketClientConfig<'a> {
-    fn default() -> Self {
-        Self {
-            uri: None,
-            host: None,
-            // default port is set by library
-            port: 0,
-            username: None,
-            password: None,
-            path: None,
-            disable_auto_reconnect: false,
-            // TODO: pub user_context:
-            task_prio: 0,
-            task_stack: 0,
-            buffer_size: 0,
-            transport: EspWebSocketTransport::default(),
-            subprotocol: None,
-            user_agent: None,
-            headers: None,
-            pingpong_timeout_sec: time::Duration::default(),
-            disable_pingpong_discon: false,
-            use_global_ca_store: false,
-            skip_cert_common_name_check: false,
-            keep_alive_idle: None,
-            keep_alive_interval: None,
-            keep_alive_count: None,
-            reconnect_timeout_ms: time::Duration::default(),
-            network_timeout_ms: time::Duration::default(),
-            ping_interval_sec: time::Duration::default(),
-            // TODO: pub if_name:
-        }
-    }
 }
 
 impl<'a> From<EspWebSocketClientConfig<'a>> for (esp_websocket_client_config_t, RawCstrs) {
