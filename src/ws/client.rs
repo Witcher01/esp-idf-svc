@@ -213,8 +213,9 @@ impl EspWebSocketClient {
         Ok(result as _)
     }
 
-    fn send_bin(
+    fn send_data(
         &mut self,
+        frame_type: FrameType,
         frame_data: Option<&[u8]>,
     ) -> Result<usize, <EspWebSocketClient as Errors>::Error> {
         let mut content = core::ptr::null();
@@ -225,13 +226,26 @@ impl EspWebSocketClient {
             content_length = data.as_ref().len();
         }
 
-        Self::check(unsafe {
-            esp_websocket_client_send_bin(
-                self.handle,
-                content as _,
-                content_length as _,
-                self.timeout,
-            )
+        Self::check(match frame_type {
+            FrameType::Binary(false) => unsafe {
+                esp_websocket_client_send_bin(
+                    self.handle,
+                    content as _,
+                    content_length as _,
+                    self.timeout,
+                )
+            },
+            FrameType::Text(false) => unsafe {
+                esp_websocket_client_send_text(
+                    self.handle,
+                    content as _,
+                    content_length as _,
+                    self.timeout,
+                )
+            },
+            _ => {
+                unimplemented!();
+            }
         })
     }
 }
@@ -254,8 +268,11 @@ impl Sender for EspWebSocketClient {
         frame_data: Option<&[u8]>,
     ) -> Result<(), Self::Error> {
         // TODO: exhaustive
+        // TODO: implement fragmented sending of data
         match frame_type {
-            FrameType::Binary(_) => self.send_bin(frame_data)?,
+            FrameType::Binary(false) | FrameType::Text(false) => {
+                self.send_data(frame_type, frame_data)?
+            }
             _ => todo!(),
         };
 
