@@ -1,11 +1,24 @@
+use alloc::sync::Arc;
 use core::time;
 
 use embedded_svc::{
     errors::Errors,
     ws::{FrameType, Sender},
 };
-use esp_idf_hal::delay::TickType;
-use esp_idf_sys::*;
+use esp_idf_hal::{
+    delay::TickType,
+    mutex::{Condvar, Mutex},
+};
+use esp_idf_sys::{
+    c_types, esp, esp_event_base_t, esp_websocket_client_close, esp_websocket_client_config_t,
+    esp_websocket_client_destroy, esp_websocket_client_handle_t, esp_websocket_client_init,
+    esp_websocket_client_send_bin, esp_websocket_client_send_text, esp_websocket_client_start,
+    esp_websocket_event_data_t, esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY,
+    esp_websocket_register_events, esp_websocket_transport_t,
+    esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
+    esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_TCP,
+    esp_websocket_transport_t_WEBSOCKET_TRANSPORT_UNKNOWN, EspError, TickType_t, ESP_FAIL,
+};
 
 use crate::private::common::Newtype;
 use crate::private::cstr::RawCstrs;
@@ -144,32 +157,140 @@ impl<'a> From<EspWebSocketClientConfig<'a>> for (esp_websocket_client_config_t, 
     }
 }
 
+struct UnsafeCallback(*mut Box<dyn FnMut(*mut esp_websocket_event_data_t)>);
+
+impl UnsafeCallback {
+    fn from(boxed: &mut Box<Box<dyn FnMut(*mut esp_websocket_event_data_t)>>) -> Self {
+        Self(boxed.as_mut())
+    }
+
+    unsafe fn from_ptr(ptr: *mut c_types::c_void) -> Self {
+        Self(ptr as *mut _)
+    }
+
+    fn as_ptr(&self) -> *mut c_types::c_void {
+        self.0 as *mut _
+    }
+
+    unsafe fn call(&self, data: *mut esp_websocket_event_data_t) {
+        let reference = self.0.as_mut().unwrap();
+
+        (reference)(data);
+    }
+}
+
+#[cfg_attr(version("1.61"), allow(suspicious_auto_trait_impls))]
+unsafe impl Send for Newtype<*mut esp_websocket_event_data_t> {}
+
+struct EspWebSocketConnectionState {
+    message: Mutex<Option<Newtype<*mut esp_websocket_event_data_t>>>,
+    posted: Condvar,
+    processed: Condvar,
+}
+
+#[derive(Clone)]
+pub struct EspWebSocketConnection(Arc<EspWebSocketConnectionState>);
+
+impl EspWebSocketConnection {
+    fn post(&self, event: *mut esp_websocket_event_data_t) {
+        let mut message = self.0.message.lock();
+
+        while message.is_some() {
+            message = self.0.processed.wait(message);
+        }
+
+        *message = Some(Newtype(event));
+        self.0.posted.notify_all();
+
+        while message.is_some() {
+            message = self.0.processed.wait(message);
+        }
+    }
+}
+
 pub struct EspWebSocketClient {
     handle: esp_websocket_client_handle_t,
     // used for the timeout in every call to a send method in the c lib as the
     // `send` method in the `Sender` trait in embedded_svc::ws does not take a timeout itself
+    // TODO: put timeout into config?
     timeout: TickType_t,
+    // TODO: is saving the callback needed?
+    callback: Box<dyn FnMut(*mut esp_websocket_event_data_t)>,
 }
 
 impl EspWebSocketClient {
     pub fn new(
         config: EspWebSocketClientConfig,
         timeout: time::Duration,
+    ) -> Result<(Self, EspWebSocketConnection), EspError> {
+        let state = Arc::new(EspWebSocketConnectionState {
+            message: Mutex::new(None),
+            posted: Condvar::new(),
+            processed: Condvar::new(),
+        });
+
+        let connection = EspWebSocketConnection(state);
+        let client_connection = connection.clone();
+
+        let client = Self::new_with_raw_callback(
+            config,
+            timeout,
+            Box::new(move |event_handle| {
+                EspWebSocketConnection::post(&client_connection, event_handle)
+            }),
+        )?;
+
+        Ok((client, connection))
+    }
+
+    // TODO: fn new_with_callback
+
+    fn new_with_raw_callback(
+        config: EspWebSocketClientConfig,
+        timeout: time::Duration,
+        raw_callback: Box<dyn FnMut(*mut esp_websocket_event_data_t)>,
     ) -> Result<Self, EspError> {
+        let mut boxed_raw_callback = Box::new(raw_callback);
+        let unsafe_callback = UnsafeCallback::from(&mut boxed_raw_callback);
+
+        let t: TickType = timeout.into();
+
         let (conf, _cstrs): (esp_websocket_client_config_t, RawCstrs) = config.into();
         let handle = unsafe { esp_websocket_client_init(&conf) };
 
         if handle.is_null() {
             esp!(ESP_FAIL)?;
         }
-        esp!(unsafe { esp_websocket_client_start(handle) })?;
 
-        let t: TickType = timeout.into();
-
-        Ok(Self {
+        let client = Self {
             handle,
             timeout: t.0,
-        })
+            callback: boxed_raw_callback,
+        };
+
+        esp!(unsafe {
+            esp_websocket_register_events(
+                client.handle,
+                esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY,
+                Some(Self::handle),
+                unsafe_callback.as_ptr(),
+            )
+        })?;
+
+        esp!(unsafe { esp_websocket_client_start(handle) })?;
+
+        Ok(client)
+    }
+
+    extern "C" fn handle(
+        event_handler_arg: *mut c_types::c_void,
+        _event_base: esp_event_base_t,
+        _event_id: i32,
+        event_data: *mut c_types::c_void,
+    ) {
+        unsafe {
+            UnsafeCallback::from_ptr(event_handler_arg).call(event_data as _);
+        }
     }
 
     fn check(result: c_types::c_int) -> Result<usize, EspError> {
@@ -221,6 +342,8 @@ impl Drop for EspWebSocketClient {
     fn drop(&mut self) {
         esp!(unsafe { esp_websocket_client_close(self.handle, self.timeout) }).unwrap();
         esp!(unsafe { esp_websocket_client_destroy(self.handle) }).unwrap();
+
+        // timeout and callback dropped automatically
     }
 }
 
