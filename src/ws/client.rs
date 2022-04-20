@@ -117,7 +117,7 @@ impl<'a> From<EspWebSocketClientConfig<'a>> for (esp_websocket_client_config_t, 
             use_global_ca_store: conf.use_global_ca_store,
             skip_cert_common_name_check: conf.skip_cert_common_name_check,
 
-            // default keep_alive_* values, might overwritten later in this function
+            // default keep_alive_* values are overwritten later in this function
             ping_interval_sec: conf.ping_interval_sec.as_secs() as _,
 
             // TODO if_name: *mut ifreq,
@@ -208,11 +208,47 @@ impl EspWebSocketConnection {
     }
 }
 
+impl EspWebSocketConnection {
+    pub fn next(&mut self) -> Option<EspWebSocketEventData> {
+        let mut message = self.0.message.lock();
+
+        // wait for new message to arrive
+        while message.is_none() {
+            message = self.0.posted.wait(message);
+        }
+
+        let event = unsafe { message.as_ref().unwrap().0.as_ref() };
+        if let Some(event) = event {
+            let event = EspWebSocketEventData::new_from_raw(event);
+
+            event
+        } else {
+            None
+        }
+    }
+}
+
+// TODO: handle non-data frames
+pub struct EspWebSocketEventData<'a> {
+    pub data: &'a [i8],
+}
+
+impl<'a> EspWebSocketEventData<'a> {
+    fn new_from_raw(event: &esp_websocket_event_data_t) -> Option<Self> {
+        if event.data_ptr.is_null() {
+            return None;
+        }
+
+        Some(Self {
+            data: unsafe { std::slice::from_raw_parts(event.data_ptr, event.data_len as _) },
+        })
+    }
+}
+
 pub struct EspWebSocketClient {
     handle: esp_websocket_client_handle_t,
     // used for the timeout in every call to a send method in the c lib as the
     // `send` method in the `Sender` trait in embedded_svc::ws does not take a timeout itself
-    // TODO: put timeout into config?
     timeout: TickType_t,
     // TODO: is saving the callback needed?
     callback: Box<dyn FnMut(*mut esp_websocket_event_data_t)>,
@@ -243,13 +279,14 @@ impl EspWebSocketClient {
         Ok((client, connection))
     }
 
-    // TODO: fn new_with_callback
-
     fn new_with_raw_callback(
         config: EspWebSocketClientConfig,
         timeout: time::Duration,
+        // TODO: raw_callback: Box<dyn FnMut(EspWebSocketEventData)>
         raw_callback: Box<dyn FnMut(*mut esp_websocket_event_data_t)>,
     ) -> Result<Self, EspError> {
+        // TODO: convert `esp_websocket_event_data_t` to `EspWebSocketEventData` for users to
+        // use the callback easier
         let mut boxed_raw_callback = Box::new(raw_callback);
         let unsafe_callback = UnsafeCallback::from(&mut boxed_raw_callback);
 
@@ -362,8 +399,9 @@ impl Sender for EspWebSocketClient {
                 self.send_data(frame_type, frame_data)?
             }
             FrameType::Binary(true) | FrameType::Text(true) => todo!(),
-            FrameType::Ping => todo!(),
-            FrameType::Pong => todo!(),
+            FrameType::Ping | FrameType::Pong => {
+                unimplemented!("Handled automatically by the wrapped C library")
+            }
             FrameType::Close => todo!(),
             FrameType::SocketClose => todo!(),
             FrameType::Continue(_) => todo!(),
