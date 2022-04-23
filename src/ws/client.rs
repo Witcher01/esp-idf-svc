@@ -12,10 +12,10 @@ use esp_idf_hal::{
 use esp_idf_sys::{
     c_types, esp, esp_event_base_t, esp_websocket_client_close, esp_websocket_client_config_t,
     esp_websocket_client_destroy, esp_websocket_client_handle_t, esp_websocket_client_init,
-    esp_websocket_client_send_bin, esp_websocket_client_send_text, esp_websocket_client_start,
-    esp_websocket_event_data_t, esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY,
-    esp_websocket_register_events, esp_websocket_transport_t,
-    esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
+    esp_websocket_client_is_connected, esp_websocket_client_send_bin,
+    esp_websocket_client_send_text, esp_websocket_client_start, esp_websocket_event_data_t,
+    esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY, esp_websocket_register_events,
+    esp_websocket_transport_t, esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
     esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_TCP,
     esp_websocket_transport_t_WEBSOCKET_TRANSPORT_UNKNOWN, EspError, TickType_t, ESP_FAIL,
 };
@@ -195,6 +195,11 @@ impl EspWebSocketConnection {
     fn post(&self, event: *mut esp_websocket_event_data_t) {
         let mut message = self.0.message.lock();
 
+        // TODO: waiting in here, where is the message coming from?
+        // who notifies this condvar to be able to continue this thread and unlock the underlying
+        // mutex of the websocket lib after finishing?
+        // if it is not unlocked, the websocket lib can't unlock their own mutex, meaning sending a
+        // message will not work as it requires the mutex
         while message.is_some() {
             message = self.0.processed.wait(message);
         }
@@ -202,13 +207,14 @@ impl EspWebSocketConnection {
         *message = Some(Newtype(event));
         self.0.posted.notify_all();
 
+        // TODO: could also be waiting here instead of above
         while message.is_some() {
             message = self.0.processed.wait(message);
         }
     }
-}
 
-impl EspWebSocketConnection {
+    // TODO
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<EspWebSocketEventData> {
         let mut message = self.0.message.lock();
 
@@ -219,10 +225,14 @@ impl EspWebSocketConnection {
 
         let event = unsafe { message.as_ref().unwrap().0.as_ref() };
         if let Some(event) = event {
-            let event = EspWebSocketEventData::new_from_raw(event);
+            let event = EspWebSocketEventData::new_from_raw(event, &self.0);
 
             event
         } else {
+            // TODO: nothing has been constructed, so the message has been "processed"?
+            *message = None;
+            self.0.processed.notify_all();
+
             None
         }
     }
@@ -230,18 +240,61 @@ impl EspWebSocketConnection {
 
 // TODO: handle non-data frames
 pub struct EspWebSocketEventData<'a> {
-    pub data: &'a [i8],
+    pub frame_type: FrameType,
+    pub data: Option<&'a [i8]>,
+    state: &'a Arc<EspWebSocketConnectionState>,
 }
 
 impl<'a> EspWebSocketEventData<'a> {
-    fn new_from_raw(event: &esp_websocket_event_data_t) -> Option<Self> {
+    fn new_from_raw(
+        event: &'a esp_websocket_event_data_t,
+        state: &'a Arc<EspWebSocketConnectionState>,
+    ) -> Option<Self> {
+        let frame_type = Self::frame_type_from_op_code(event.op_code);
+
         if event.data_ptr.is_null() {
             return None;
         }
 
+        if event.data_len > 0 {
+            return Some(Self {
+                frame_type,
+                data: Some(unsafe {
+                    std::slice::from_raw_parts(event.data_ptr, event.data_len as _)
+                }),
+                state,
+            });
+        }
+
         Some(Self {
-            data: unsafe { std::slice::from_raw_parts(event.data_ptr, event.data_len as _) },
+            frame_type,
+            data: None,
+            state,
         })
+    }
+
+    fn frame_type_from_op_code(op_code: u8) -> FrameType {
+        // https://datatracker.ietf.org/doc/html/rfc6455#page-66
+        match op_code {
+            0 => FrameType::Continue(true), // TODO: check if more frames are coming
+            1 => FrameType::Text(false),    // TODO: assuming that all the data has been sent
+            2 => FrameType::Binary(false),  // TODO: like Text
+            8 => FrameType::Close,
+            9 => FrameType::Ping,
+            10 => FrameType::Pong,
+            other => panic!("Unknown frame type: {}", other),
+        }
+    }
+}
+
+impl<'a> Drop for EspWebSocketEventData<'a> {
+    fn drop(&mut self) {
+        let mut message = self.state.message.lock();
+
+        if message.is_some() {
+            *message = None;
+            self.state.processed.notify_all();
+        }
     }
 }
 
@@ -394,6 +447,10 @@ impl Sender for EspWebSocketClient {
         frame_type: FrameType,
         frame_data: Option<&[u8]>,
     ) -> Result<(), Self::Error> {
+        while !unsafe { esp_websocket_client_is_connected(self.handle) } {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
         match frame_type {
             FrameType::Binary(false) | FrameType::Text(false) => {
                 self.send_data(frame_type, frame_data)?
