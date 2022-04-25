@@ -12,9 +12,9 @@ use esp_idf_hal::{
 use esp_idf_sys::{
     c_types, esp, esp_event_base_t, esp_websocket_client_close, esp_websocket_client_config_t,
     esp_websocket_client_destroy, esp_websocket_client_handle_t, esp_websocket_client_init,
-    esp_websocket_client_is_connected, esp_websocket_client_send_bin,
-    esp_websocket_client_send_text, esp_websocket_client_start, esp_websocket_event_data_t,
-    esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY, esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED,
+    esp_websocket_client_send_bin, esp_websocket_client_send_text, esp_websocket_client_start,
+    esp_websocket_event_data_t, esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY,
+    esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED,
     esp_websocket_event_id_t_WEBSOCKET_EVENT_CONNECTED,
     esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA,
     esp_websocket_event_id_t_WEBSOCKET_EVENT_DISCONNECTED,
@@ -27,6 +27,8 @@ use esp_idf_sys::{
 
 use crate::private::common::Newtype;
 use crate::private::cstr::{self, RawCstrs};
+
+use ::anyhow::bail;
 
 pub enum EspWebSocketTransport {
     TransportUnknown,
@@ -56,30 +58,85 @@ impl From<EspWebSocketTransport> for Newtype<esp_websocket_transport_t> {
     }
 }
 
-pub enum WebSocketEvent<'a> {
+pub struct WebSocketEvent<'a> {
+    pub event_type: WebSocketEventType<'a>,
+    state: Arc<EspWebSocketConnectionState>,
+}
+
+impl<'a> WebSocketEvent<'a> {
+    fn new(
+        event_id: i32,
+        event_data: &'a esp_websocket_event_data_t,
+        state: &Arc<EspWebSocketConnectionState>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            event_type: WebSocketEventType::new(event_id, event_data)?,
+            state: state.clone(),
+        })
+    }
+}
+
+impl<'a> Drop for WebSocketEvent<'a> {
+    fn drop(&mut self) {
+        let mut message = self.state.message.lock();
+
+        if message.is_some() {
+            *message = None;
+            self.state.processed.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WebSocketClosingReason {
+    PurposeFulfilled,
+    GoingAway,
+    ProtocolError,
+    UnacceptableData,
+    Reserved(u16),
+    InconsistentType,
+    PolicyViolated,
+    MessageTooBig,
+    ExtensionNotReturned,
+    UnexpectedCondition,
+}
+
+impl WebSocketClosingReason {
+    fn new(code: u16) -> anyhow::Result<Self> {
+        match code {
+            1000 => Ok(Self::PurposeFulfilled),
+            1001 => Ok(Self::GoingAway),
+            1002 => Ok(Self::ProtocolError),
+            1003 => Ok(Self::UnacceptableData),
+            1004..=1006 | 1015 => Ok(Self::Reserved(code)),
+            1007 => Ok(Self::InconsistentType),
+            1008 => Ok(Self::PolicyViolated),
+            1009 => Ok(Self::MessageTooBig),
+            1010 => Ok(Self::ExtensionNotReturned),
+            1011 => Ok(Self::UnexpectedCondition),
+            _ => bail!("Unsupported closing status code"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WebSocketEventType<'a> {
     Connected,
     Disconnected,
+    Close(Option<WebSocketClosingReason>),
     Closed,
     Text(alloc::borrow::Cow<'a, str>),
     Binary(&'a [u8]),
 }
 
-impl<'a> WebSocketEvent<'a> {
-    // TODO: error
-    pub fn from_raw_event(
-        event_id: i32,
-        event_data: *mut esp_websocket_event_data_t,
-    ) -> Result<Self, ()> {
+impl<'a> WebSocketEventType<'a> {
+    pub fn new(event_id: i32, event_data: &'a esp_websocket_event_data_t) -> anyhow::Result<Self> {
         #[allow(non_upper_case_globals)]
         match event_id {
-            esp_websocket_event_id_t_WEBSOCKET_EVENT_ERROR => {
-                // TODO: error
-                Err(())
-            }
+            esp_websocket_event_id_t_WEBSOCKET_EVENT_ERROR => bail!("WebSocket Event Error"),
             esp_websocket_event_id_t_WEBSOCKET_EVENT_CONNECTED => Ok(Self::Connected),
             esp_websocket_event_id_t_WEBSOCKET_EVENT_DISCONNECTED => Ok(Self::Disconnected),
             esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA => {
-                let event_data = unsafe { *event_data };
                 match event_data.op_code {
                     // Text frame
                     1 => Ok(Self::Text(cstr::from_cstr_ptr(event_data.data_ptr))),
@@ -90,19 +147,27 @@ impl<'a> WebSocketEvent<'a> {
                             event_data.data_len as usize,
                         )
                     })),
-                    // TODO: error
-                    _ => Err(()),
+                    // Closing Frame
+                    // may contain a reason for closing the connection
+                    8 => Ok(Self::Close(if event_data.data_len >= 2 {
+                        Some(WebSocketClosingReason::new(u16::from_be(
+                            event_data.data_ptr as _,
+                        ))?)
+                    } else {
+                        None
+                    })),
+                    _ => bail!(
+                        "WebSocket Data Event contains wrong OpCode: {}",
+                        event_data.op_code
+                    ),
                 }
             }
             esp_websocket_event_id_t_WEBSOCKET_EVENT_CLOSED => Ok(Self::Closed),
             esp_websocket_event_id_t_WEBSOCKET_EVENT_MAX => {
-                // TODO: error
-                Err(())
+                // TODO: is this the correct meaning of EVENT_MAX?
+                bail!("Exceeded maximum packet size")
             }
-            _ => {
-                // TODO: error
-                Err(())
-            }
+            default => bail!("Unrecognized WebSocket event: {}", default),
         }
     }
 }
@@ -228,26 +293,23 @@ impl UnsafeCallback {
         self.0 as *mut _
     }
 
-    unsafe fn call(&self, data: *mut esp_websocket_event_data_t, event_id: i32) {
+    unsafe fn call(&self, event_id: i32, data: *mut esp_websocket_event_data_t) {
         let reference = self.0.as_mut().unwrap();
 
-        // TODO: more elegant, somewhere else?
-        if event_id == esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA {
-            (reference)(event_id, data);
-        }
+        (reference)(event_id, data);
     }
 }
 
 #[cfg_attr(version("1.61"), allow(suspicious_auto_trait_impls))]
 unsafe impl Send for Newtype<*mut esp_websocket_event_data_t> {}
 
-struct EspWebSocketConnectionState<'a> {
-    message: Mutex<Option<WebSocketEvent<'a>>>,
+struct EspWebSocketConnectionState {
+    message: Mutex<Option<(i32, Newtype<*mut esp_websocket_event_data_t>)>>,
     posted: Condvar,
     processed: Condvar,
 }
 
-impl<'a> Default for EspWebSocketConnectionState<'a> {
+impl Default for EspWebSocketConnectionState {
     fn default() -> Self {
         Self {
             message: Mutex::new(None),
@@ -258,23 +320,23 @@ impl<'a> Default for EspWebSocketConnectionState<'a> {
 }
 
 #[derive(Clone)]
-pub struct EspWebSocketConnection<'a>(Arc<EspWebSocketConnectionState<'a>>);
+pub struct EspWebSocketConnection(Arc<EspWebSocketConnectionState>);
 
-impl<'a> Default for EspWebSocketConnection<'a> {
+impl Default for EspWebSocketConnection {
     fn default() -> Self {
         Self(Arc::new(EspWebSocketConnectionState::default()))
     }
 }
 
-impl<'a> EspWebSocketConnection<'a> {
-    fn post(&self, event: WebSocketEvent<'a>) {
+impl EspWebSocketConnection {
+    fn post(&self, event_id: i32, event: *mut esp_websocket_event_data_t) {
         let mut message = self.0.message.lock();
 
         while message.is_some() {
             message = self.0.processed.wait(message);
         }
 
-        *message = Some(event);
+        *message = Some((event_id, Newtype(event)));
         self.0.posted.notify_all();
 
         while message.is_some() {
@@ -282,9 +344,10 @@ impl<'a> EspWebSocketConnection<'a> {
         }
     }
 
-    // TODO iterator
+    // NOTE: cannot implement the `Iterator` trait as it requires that all the items can be alive
+    // at the same time, which is not given here
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<WebSocketEvent<'a>> {
+    pub fn next(&mut self) -> Option<anyhow::Result<WebSocketEvent>> {
         let mut message = self.0.message.lock();
 
         // wait for new message to arrive
@@ -292,79 +355,18 @@ impl<'a> EspWebSocketConnection<'a> {
             message = self.0.posted.wait(message);
         }
 
-        if message.is_none() {
-            *message = None;
-            self.0.processed.notify_all();
+        let event_id = message.as_ref().unwrap().0;
+        let event = unsafe { message.as_ref().unwrap().1 .0.as_ref() };
+        if let Some(event) = event {
+            let wse = WebSocketEvent::new(event_id, event, &self.0);
 
-            return None;
-        }
-
-        *message
-    }
-}
-
-// TODO: handle non-data frames
-pub struct EspWebSocketEventData<'a> {
-    pub frame_type: FrameType,
-    pub data: Option<&'a [i8]>,
-    state: &'a Arc<EspWebSocketConnectionState<'a>>,
-}
-
-impl<'a> EspWebSocketEventData<'a> {
-    fn new_from_raw(
-        event: &'a esp_websocket_event_data_t,
-        state: &'a Arc<EspWebSocketConnectionState<'a>>,
-    ) -> Option<Self> {
-        let frame_type = Self::frame_type_from_op_code(event.op_code);
-
-        if event.data_ptr.is_null() {
-            return None;
-        }
-
-        if event.data_len > 0 {
-            return Some(Self {
-                frame_type,
-                data: Some(unsafe {
-                    std::slice::from_raw_parts(event.data_ptr, event.data_len as _)
-                }),
-                state,
-            });
-        }
-
-        Some(Self {
-            frame_type,
-            data: None,
-            state,
-        })
-    }
-
-    // TODO: move somewhere more fitting
-    fn frame_type_from_op_code(op_code: u8) -> FrameType {
-        // https://datatracker.ietf.org/doc/html/rfc6455#page-66
-        match op_code {
-            0 => FrameType::Continue(true), // TODO: check if more frames are coming
-            1 => FrameType::Text(false),    // TODO: assuming that all the data has been sent
-            2 => FrameType::Binary(false),  // TODO: like Text
-            8 => FrameType::Close,
-            9 => FrameType::Ping,
-            10 => FrameType::Pong,
-            other => panic!("Unknown frame type: {}", other),
+            Some(wse)
+        } else {
+            None
         }
     }
 }
 
-impl<'a> Drop for EspWebSocketEventData<'a> {
-    fn drop(&mut self) {
-        let mut message = self.state.message.lock();
-
-        if message.is_some() {
-            *message = None;
-            self.state.processed.notify_all();
-        }
-    }
-}
-
-// TODO: replace EspWebSocketClientConfig with a builder interface
 pub struct EspWebSocketClient {
     handle: esp_websocket_client_handle_t,
     // used for the timeout in every call to a send method in the c lib as the
@@ -385,11 +387,7 @@ impl EspWebSocketClient {
             config,
             timeout,
             Box::new(move |event_id, event_handle| {
-                match WebSocketEvent::from_raw_event(event_id, event_handle) {
-                    Ok(v) => EspWebSocketConnection::post(&client_connection, v),
-                    // TODO: error
-                    Err(e) => todo!(),
-                };
+                EspWebSocketConnection::post(&client_connection, event_id, event_handle);
             }),
         )?;
 
@@ -440,7 +438,7 @@ impl EspWebSocketClient {
         event_data: *mut c_types::c_void,
     ) {
         unsafe {
-            UnsafeCallback::from_ptr(event_handler_arg).call(event_data as _, event_id);
+            UnsafeCallback::from_ptr(event_handler_arg).call(event_id, event_data as _);
         }
     }
 
@@ -483,7 +481,7 @@ impl EspWebSocketClient {
                 )
             },
             _ => {
-                unimplemented!();
+                panic!("Unsupported sending operation!");
             }
         })
     }
@@ -508,21 +506,26 @@ impl Sender for EspWebSocketClient {
         frame_type: FrameType,
         frame_data: Option<&[u8]>,
     ) -> Result<(), Self::Error> {
-        while !unsafe { esp_websocket_client_is_connected(self.handle) } {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
+        // NOTE: fragmented sending, as well as Closing or Continuing a connection, is not
+        // supported by the underlying C library and/or happen implicitly, e.g. when the
+        // `EspWebSocketClient` is dropped.
         match frame_type {
             FrameType::Binary(false) | FrameType::Text(false) => {
                 self.send_data(frame_type, frame_data)?
             }
-            FrameType::Binary(true) | FrameType::Text(true) => todo!(),
-            FrameType::Ping | FrameType::Pong => {
-                unimplemented!("Handled automatically by the wrapped C library")
+            FrameType::Binary(true) | FrameType::Text(true) => {
+                panic!("Unsupported operation: Sending of fragmented data!")
             }
-            FrameType::Close => todo!(),
-            FrameType::SocketClose => todo!(),
-            FrameType::Continue(_) => todo!(),
+            FrameType::Ping | FrameType::Pong => {
+                panic!("Unsupported operation: Sending of Ping/Pong frames!")
+            }
+            FrameType::Close => {
+                panic!("Unsupported operation: Closing a connection manually (drop the client instead)!")
+            }
+            FrameType::SocketClose => {
+                panic!("Unsupported operation: Closing a connection manually (drop the client instead)!")
+            }
+            FrameType::Continue(_) => panic!("Unsupported operation: Sending of fragmented data!"),
         };
 
         Ok(())
