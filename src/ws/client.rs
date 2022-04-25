@@ -14,8 +14,9 @@ use esp_idf_sys::{
     esp_websocket_client_destroy, esp_websocket_client_handle_t, esp_websocket_client_init,
     esp_websocket_client_is_connected, esp_websocket_client_send_bin,
     esp_websocket_client_send_text, esp_websocket_client_start, esp_websocket_event_data_t,
-    esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY, esp_websocket_register_events,
-    esp_websocket_transport_t, esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
+    esp_websocket_event_id_t_WEBSOCKET_EVENT_ANY, esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA,
+    esp_websocket_register_events, esp_websocket_transport_t,
+    esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_SSL,
     esp_websocket_transport_t_WEBSOCKET_TRANSPORT_OVER_TCP,
     esp_websocket_transport_t_WEBSOCKET_TRANSPORT_UNKNOWN, EspError, TickType_t, ESP_FAIL,
 };
@@ -49,6 +50,14 @@ impl From<EspWebSocketTransport> for Newtype<esp_websocket_transport_t> {
             }
         })
     }
+}
+
+pub enum WebSocketEvent {
+    Connected,
+    Disconnected,
+    Closed,
+    Data,
+    Error,
 }
 
 #[derive(Default)]
@@ -172,10 +181,13 @@ impl UnsafeCallback {
         self.0 as *mut _
     }
 
-    unsafe fn call(&self, data: *mut esp_websocket_event_data_t) {
+    unsafe fn call(&self, data: *mut esp_websocket_event_data_t, event_id: i32) {
         let reference = self.0.as_mut().unwrap();
 
-        (reference)(data);
+        // TODO: more elegant, somewhere else?
+        if event_id == esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA {
+            (reference)(data);
+        }
     }
 }
 
@@ -192,6 +204,7 @@ struct EspWebSocketConnectionState {
 pub struct EspWebSocketConnection(Arc<EspWebSocketConnectionState>);
 
 impl EspWebSocketConnection {
+    // TODO: check if a message or a frame was received
     fn post(&self, event: *mut esp_websocket_event_data_t) {
         let mut message = self.0.message.lock();
 
@@ -213,7 +226,7 @@ impl EspWebSocketConnection {
         }
     }
 
-    // TODO
+    // TODO iterator
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<EspWebSocketEventData> {
         let mut message = self.0.message.lock();
@@ -273,6 +286,7 @@ impl<'a> EspWebSocketEventData<'a> {
         })
     }
 
+    // TODO: move somewhere more fitting
     fn frame_type_from_op_code(op_code: u8) -> FrameType {
         // https://datatracker.ietf.org/doc/html/rfc6455#page-66
         match op_code {
@@ -298,6 +312,7 @@ impl<'a> Drop for EspWebSocketEventData<'a> {
     }
 }
 
+// TODO: replace EspWebSocketClientConfig with a builder interface
 pub struct EspWebSocketClient {
     handle: esp_websocket_client_handle_t,
     // used for the timeout in every call to a send method in the c lib as the
@@ -335,11 +350,8 @@ impl EspWebSocketClient {
     fn new_with_raw_callback(
         config: EspWebSocketClientConfig,
         timeout: time::Duration,
-        // TODO: raw_callback: Box<dyn FnMut(EspWebSocketEventData)>
         raw_callback: Box<dyn FnMut(*mut esp_websocket_event_data_t)>,
     ) -> Result<Self, EspError> {
-        // TODO: convert `esp_websocket_event_data_t` to `EspWebSocketEventData` for users to
-        // use the callback easier
         let mut boxed_raw_callback = Box::new(raw_callback);
         let unsafe_callback = UnsafeCallback::from(&mut boxed_raw_callback);
 
@@ -375,11 +387,11 @@ impl EspWebSocketClient {
     extern "C" fn handle(
         event_handler_arg: *mut c_types::c_void,
         _event_base: esp_event_base_t,
-        _event_id: i32,
+        event_id: i32,
         event_data: *mut c_types::c_void,
     ) {
         unsafe {
-            UnsafeCallback::from_ptr(event_handler_arg).call(event_data as _);
+            UnsafeCallback::from_ptr(event_handler_arg).call(event_data as _, event_id);
         }
     }
 
